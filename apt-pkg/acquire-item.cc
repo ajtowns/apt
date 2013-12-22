@@ -347,7 +347,7 @@ pkgAcqDiffIndex::pkgAcqDiffIndex(pkgAcquire *Owner,
    Desc.URI = URI + ".diff/Index";
 
    DestFile = _config->FindDir("Dir::State::lists") + "partial/";
-   DestFile += URItoFileName(URI) + string(".DiffIndex");
+   DestFile += URItoFileName(URI) + string(".IndexDiff");
 
    if(Debug)
       std::clog << "pkgAcqDiffIndex: " << Desc.URI << std::endl;
@@ -370,7 +370,7 @@ pkgAcqDiffIndex::pkgAcqDiffIndex(pkgAcquire *Owner,
    }
 
    if(Debug) 
-      std::clog << "pkgAcqIndexDiffs::pkgAcqIndexDiffs(): " 
+      std::clog << "pkgAcqDiffIndex::pkgAcqDiffIndex(): " 
 		<< CurrentPackagesFile << std::endl;
    
    QueueURI(Desc);
@@ -398,7 +398,7 @@ string pkgAcqDiffIndex::Custom600Headers()
 bool pkgAcqDiffIndex::ParseDiffIndex(string IndexDiffFile)		/*{{{*/
 {
    if(Debug)
-      std::clog << "pkgAcqIndexDiffs::ParseIndexDiff() " << IndexDiffFile 
+      std::clog << "pkgAcqDiffIndex::ParseDiffIndex() " << IndexDiffFile 
 		<< std::endl;
 
    pkgTagSection Tags;
