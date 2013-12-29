@@ -70,10 +70,11 @@ class pkgAcqMethod
    std::string FailReason;
    std::string UsedMirror;
    std::string IP;
-   
+
    // Handlers for messages
+   virtual bool HandleMessage(int Number, std::string Message);
    virtual bool Configuration(std::string Message);
-   virtual bool Fetch(FetchItem * /*Item*/) {return true;};
+   virtual bool Fetch(FetchItem * /*Item*/) = 0;
    
    // Outgoing messages
    void Fail(bool Transient = false);

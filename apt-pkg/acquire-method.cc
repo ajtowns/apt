@@ -295,6 +295,47 @@ bool pkgAcqMethod::Configuration(string Message)
    return true;
 }
 									/*}}}*/
+// AcqMethod::HandleMessage - Handle a message 				/*{{{*/
+// ---------------------------------------------------------------------
+/* Given a message, execute it. */
+bool pkgAcqMethod::HandleMessage(int Number, std::string Message)
+{
+   switch (Number)
+   {
+      case 601:
+      return Configuration(Message);
+
+      case 600:
+      {
+	 FetchItem *Tmp = new FetchItem;
+
+	 Tmp->Uri = LookupTag(Message,"URI");
+	 Tmp->DestFile = LookupTag(Message,"FileName");
+	 if (RFC1123StrToTime(LookupTag(Message,"Last-Modified").c_str(),Tmp->LastModified) == false)
+	    Tmp->LastModified = 0;
+	 Tmp->IndexFile = StringToBool(LookupTag(Message,"Index-File"),false);
+	 Tmp->FailIgnore = StringToBool(LookupTag(Message,"Fail-Ignore"),false);
+	 Tmp->Next = 0;
+
+	 // Append it to the list
+	 FetchItem **I = &Queue;
+	 for (; *I != 0; I = &(*I)->Next);
+	 *I = Tmp;
+	 if (QueueBack == 0)
+	    QueueBack = Tmp;
+
+	 // Notify that this item is to be fetched.
+	 if (Fetch(Tmp) == false)
+	    Fail();
+
+	 return true;
+      }
+
+      default:
+         return true;
+   }
+}
+									/*}}}*/
 // AcqMethod::Run - Run the message engine				/*{{{*/
 // ---------------------------------------------------------------------
 /* Fetch any messages and execute them. In single mode it returns 1 if
@@ -330,39 +371,8 @@ int pkgAcqMethod::Run(bool Single)
 	 return 100;
       }
 
-      switch (Number)
-      {	 
-	 case 601:
-	 if (Configuration(Message) == false)
-	    return 100;
-	 break;
-	 
-	 case 600:
-	 {
-	    FetchItem *Tmp = new FetchItem;
-	    
-	    Tmp->Uri = LookupTag(Message,"URI");
-	    Tmp->DestFile = LookupTag(Message,"FileName");
-	    if (RFC1123StrToTime(LookupTag(Message,"Last-Modified").c_str(),Tmp->LastModified) == false)
-	       Tmp->LastModified = 0;
-	    Tmp->IndexFile = StringToBool(LookupTag(Message,"Index-File"),false);
-	    Tmp->FailIgnore = StringToBool(LookupTag(Message,"Fail-Ignore"),false);
-	    Tmp->Next = 0;
-	    
-	    // Append it to the list
-	    FetchItem **I = &Queue;
-	    for (; *I != 0; I = &(*I)->Next);
-	    *I = Tmp;
-	    if (QueueBack == 0)
-	       QueueBack = Tmp;
-	    
-	    // Notify that this item is to be fetched.
-	    if (Fetch(Tmp) == false)
-	       Fail();
-	    
-	    break;					     
-	 }   
-      }      
+      if (HandleMessage(Number, Message) == false)
+	  return 100;
    }
 
    Exit();
