@@ -708,8 +708,23 @@ void pkgAcqIndexDiffs::Done(string Message,unsigned long long Size,string Md5Has
    string FinalFile;
    FinalFile = _config->FindDir("Dir::State::lists")+URItoFileName(RealURI);
 
-   // sucess in downloading a diff, enter ApplyDiff state
+   // sucess in downloading a diff, un-gzip it
    if(State == StateFetchDiff)
+   {
+      // rred excepts the patch as $FinalFile.ed
+      Rename(DestFile,FinalFile+".ed.gz");
+      if(Debug)
+	 std::clog << "Sending ed to gzip method: " << FinalFile << std::endl;
+      State = StateUnzipDiff;
+      Local = true;
+      Desc.URI = "gzip:" + FinalFile + ".ed.gz";
+      QueueURI(Desc);
+      Mode = "gzip";
+      return;
+   }
+
+   // sucess in ungzipping the diff, enter ApplyDiff state
+   if(State == StateUnzipDiff)
    {
 
       // rred excepts the patch as $FinalFile.ed
