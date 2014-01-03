@@ -359,11 +359,11 @@ class pkgAcqSubIndex : public pkgAcquire::Item
  *
  *  This item downloads the Index file and parses it, then enqueues
  *  additional downloads of either the individual patches (using
- *  pkgAcqIndexDiffs) or the entire Packages file (using pkgAcqIndex).
+ *  pkgAcqIndexDiff) or the entire Packages file (using pkgAcqIndex).
  *
- *  \sa pkgAcqIndexDiffs, pkgAcqIndex
+ *  \sa pkgAcqIndexDiff, pkgAcqIndex
  */
-class pkgAcqDiffIndex : public pkgAcquire::Item
+class pkgAcqIndexByDiffs : public pkgAcquire::Item
 {
  protected:
    /** \brief If \b true, debugging information will be written to std::clog. */
@@ -392,28 +392,42 @@ class pkgAcqDiffIndex : public pkgAcquire::Item
     */
    std::string Description;
 
- public:
-   // Specialized action members
-   virtual void Failed(std::string Message,pkgAcquire::MethodConfig *Cnf);
-   virtual void Done(std::string Message,unsigned long long Size,std::string Md5Hash,
-		     pkgAcquire::MethodConfig *Cnf);
-   virtual std::string DescURI() {return RealURI + "Index";};
-   virtual std::string Custom600Headers();
-
    /** \brief Parse the Index file for a set of Packages diffs.
     *
     *  Parses the Index file and creates additional download items as
     *  necessary.
     *
-    *  \param IndexDiffFile The name of the Index file.
+    *  \param DiffIndexFile The name of the Index file.
     *
     *  \return \b true if the Index file was successfully parsed, \b
     *  false otherwise.
     */
-   bool ParseDiffIndex(std::string IndexDiffFile);
-   
+   bool ParseDiffIndex(std::string DiffIndexFile);
 
-   /** \brief Create a new pkgAcqDiffIndex.
+   enum IndexDiffState {
+     StateIndexDownload,
+     StateDiffsDownload,
+     StateDiffsApply,
+     StateCompleted,
+     StateFailed,
+   } State;
+
+   size_t DiffsToDownload;
+   std::vector<DiffInfo> RequiredDiffs;
+ 
+ public:
+   // Specialized action members
+   virtual void Failed(std::string Message,pkgAcquire::MethodConfig *Cnf);
+   virtual void Done(std::string Message,unsigned long long Size,
+		     std::string Md5Hash,
+		     pkgAcquire::MethodConfig *Cnf);
+
+   virtual void DiffDownloaded(bool success);
+
+   virtual std::string DescURI() {return RealURI + "Index";};
+   virtual std::string Custom600Headers();
+
+   /** \brief Create a new pkgAcqIndexByDiffs.
     *
     *  \param Owner The Acquire object that owns this item.
     *
@@ -425,50 +439,26 @@ class pkgAcqDiffIndex : public pkgAcquire::Item
     *
     *  \param ExpectedHash The list file's MD5 signature.
     */
-   pkgAcqDiffIndex(pkgAcquire *Owner,std::string URI,std::string URIDesc,
+   pkgAcqIndexByDiffs(pkgAcquire *Owner,std::string URI,std::string URIDesc,
 		   std::string ShortDesc, HashString ExpectedHash);
 };
 									/*}}}*/
-/** \brief An item that is responsible for fetching all the patches	{{{
- *  that need to be applied to a given package index file.
+/** \brief An item that is responsible for fetching a patch		  {{{
+ *  that needs to be applied to a given package index file.
  *
  *  After downloading and applying a single patch, this item will
- *  enqueue a new pkgAcqIndexDiffs to download and apply the remaining
- *  patches.  If no patch can be found that applies to an intermediate
- *  file or if one of the patches cannot be downloaded, falls back to
- *  downloading the entire package index file using pkgAcqIndex.
+ *  notify the pkgAcqIndexByDiffs object that created it, and similarly
+ *  for the failure to download case.
  *
- *  \sa pkgAcqDiffIndex, pkgAcqIndex
+ *  \sa pkgAcqIndexByDiffs, pkgAcqIndex
  */
-class pkgAcqIndexDiffs : public pkgAcquire::Item
+class pkgAcqIndexDiff : public pkgAcquire::Item
 {
-   private:
-
-   /** \brief Queue up the next diff download.
-    *
-    *  Search for the next available diff that applies to the file
-    *  that currently exists on disk, and enqueue it by calling
-    *  QueueURI().
-    *
-    *  \return \b true if an applicable diff was found, \b false
-    *  otherwise.
-    */
-   bool QueueNextDiff();
-
-   /** \brief Handle tasks that must be performed after the item
-    *  finishes downloading.
-    *
-    *  Dequeues the item and checks the resulting file's md5sum
-    *  against ExpectedHash after the last patch was applied.
-    *  There is no need to check the md5/sha1 after a "normal" 
-    *  patch because QueueNextDiff() will check the sha1 later.
-    *
-    *  \param allDone If \b true, the file was entirely reconstructed,
-    *  and its md5sum is verified. 
-    */
-   void Finish(bool allDone=false);
-
    protected:
+
+   /** \brief The parent object that wanted this diff downloaded.
+    */
+   pkgAcqIndexByDiffs *IndexByDiffs;
 
    /** \brief If \b true, debugging output will be written to
     *  std::clog.
@@ -493,16 +483,6 @@ class pkgAcqIndexDiffs : public pkgAcquire::Item
    /** A description of the file being downloaded. */
    std::string Description;
 
-   /** The patches that remain to be downloaded, including the patch
-    *  being downloaded right now.  This list should be ordered so
-    *  that each diff appears before any diff that depends on it.
-    *
-    *  \todo These are indexed by sha1sum; why not use some sort of
-    *  dictionary instead of relying on ordering and stripping them
-    *  off the front?
-    */
-   std::vector<DiffInfo> available_patches;
-
    /** Stop applying patches when reaching that sha1 */
    std::string ServerSha1;
 
@@ -510,16 +490,13 @@ class pkgAcqIndexDiffs : public pkgAcquire::Item
    enum DiffState
      {
 	/** \brief The diff is in an unknown state. */
-	 StateFetchUnkown,
+	 StateUnknown,
 
 	 /** \brief The diff is currently being fetched. */
 	 StateFetchDiff,
 	 
 	 /** \brief The diff is currently being uncompressed. */
 	 StateUnzipDiff, // FIXME: No longer used
-
-	 /** \brief The diff is currently being applied. */
-	 StateApplyDiff
    } State;
 
    public:
@@ -542,31 +519,28 @@ class pkgAcqIndexDiffs : public pkgAcquire::Item
     *
     *  \param Owner The pkgAcquire object that owns this item.
     *
-    *  \param URI The URI of the package index file being
-    *  reconstructed.
+    *  \param URI The URI of the diff file being retrieved.
     *
     *  \param URIDesc A long description of this item.
     *
     *  \param ShortDesc A brief description of this item.
     *
-    *  \param ExpectedHash The expected md5sum of the completely
-    *  reconstructed package index file; the index file will be tested
-    *  against this value when it is entirely reconstructed.
+    *  \param ServerSha1 The expected sha1sum of the diff file.
     *
     *  \param diffs The remaining diffs from the index of diffs.  They
     *  should be ordered so that each diff appears before any diff
     *  that depends on it.
     */
-   pkgAcqIndexDiffs(pkgAcquire *Owner,std::string URI,std::string URIDesc,
-		    std::string ShortDesc, HashString ExpectedHash,
-		    std::string ServerSha1,
-		    std::vector<DiffInfo> diffs=std::vector<DiffInfo>());
+   pkgAcqIndexDiff(pkgAcquire *Owner, pkgAcqIndexByDiffs *Parent,
+                    std::string URI,std::string URIDesc,
+		    std::string ShortDesc,
+		    DiffInfo &Diff);
 };
 									/*}}}*/
 /** \brief An acquire item that is responsible for fetching an index	{{{
  *  file (e.g., Packages or Sources).
  *
- *  \sa pkgAcqDiffIndex, pkgAcqIndexDiffs, pkgAcqIndexTrans
+ *  \sa pkgAcqIndexByDiffs, pkgAcqIndexTrans
  *
  *  \todo Why does pkgAcqIndex have protected members?
  */
@@ -796,7 +770,7 @@ class pkgAcqMetaSig : public pkgAcquire::Item
  *  file (i.e., Release) itself and verifying its signature.
  *
  *  Once the download and verification are complete, the downloads of
- *  the individual index files are queued up using pkgAcqDiffIndex.
+ *  the individual index files are queued up using pkgAcqIndexByDiffs.
  *  If the meta-index file had a valid signature, the expected hashsums
  *  of the index files will be the md5sums listed in the meta-index;
  *  otherwise, the expected hashsums will be "" (causing the

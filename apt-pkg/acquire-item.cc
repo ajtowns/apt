@@ -325,14 +325,15 @@ bool pkgAcqSubIndex::ParseIndex(string const &IndexFile)		/*{{{*/
    return true;
 }
 									/*}}}*/
-// AcqDiffIndex::AcqDiffIndex - Constructor				/*{{{*/
+// AcqIndexByDiffs::AcqIndexByDiffs - Constructor				/*{{{*/
 // ---------------------------------------------------------------------
-/* Get the DiffIndex file first and see if there are patches availabe 
- * If so, create a pkgAcqIndexDiffs fetcher that will get and apply the
- * patches. If anything goes wrong in that process, it will fall back to
- * the original packages file
+/* Get the IndexByDiffs file first and see if there are patches availabe 
+ * If so, create a pkgAcqIndexDiff fetcher that will get each of the
+ * patches, then apply all the patches to get the new Index. 
+ * If anything goes wrong in that process, it will fall back to
+ * the original packages file.
  */
-pkgAcqDiffIndex::pkgAcqDiffIndex(pkgAcquire *Owner,
+pkgAcqIndexByDiffs::pkgAcqIndexByDiffs(pkgAcquire *Owner,
 				 string URI,string URIDesc,string ShortDesc,
 				 HashString ExpectedHash)
    : Item(Owner), RealURI(URI), ExpectedHash(ExpectedHash),
@@ -346,11 +347,13 @@ pkgAcqDiffIndex::pkgAcqDiffIndex(pkgAcquire *Owner,
    Desc.ShortDesc = ShortDesc;
    Desc.URI = URI + ".diff/Index";
 
+   State = StateIndexDownload;
+
    DestFile = _config->FindDir("Dir::State::lists") + "partial/";
    DestFile += URItoFileName(URI) + string(".IndexDiff");
 
    if(Debug)
-      std::clog << "pkgAcqDiffIndex: " << Desc.URI << std::endl;
+      std::clog << "pkgAcqIndexByDiffs: " << Desc.URI << std::endl;
 
    // look for the current package file
    CurrentPackagesFile = _config->FindDir("Dir::State::lists");
@@ -364,13 +367,13 @@ pkgAcqDiffIndex::pkgAcqDiffIndex(pkgAcquire *Owner,
    {
       // we don't have a pkg file or we don't want to queue
       if(Debug)
-	 std::clog << "No index file, local or canceld by user" << std::endl;
+	 std::clog << "No index file, local or cancelled by user" << std::endl;
       Failed("", NULL);
       return;
    }
 
    if(Debug) 
-      std::clog << "pkgAcqDiffIndex::pkgAcqDiffIndex(): " 
+      std::clog << "pkgAcqIndexByDiffs::pkgAcqIndexByDiffs(): " 
 		<< CurrentPackagesFile << std::endl;
    
    QueueURI(Desc);
@@ -380,7 +383,7 @@ pkgAcqDiffIndex::pkgAcqDiffIndex(pkgAcquire *Owner,
 // AcqIndex::Custom600Headers - Insert custom request headers		/*{{{*/
 // ---------------------------------------------------------------------
 /* The only header we use is the last-modified header. */
-string pkgAcqDiffIndex::Custom600Headers()
+string pkgAcqIndexByDiffs::Custom600Headers()
 {
    string Final = _config->FindDir("Dir::State::lists");
    Final += URItoFileName(RealURI) + string(".IndexDiff");
@@ -391,176 +394,267 @@ string pkgAcqDiffIndex::Custom600Headers()
    struct stat Buf;
    if (stat(Final.c_str(),&Buf) != 0)
       return "\nIndex-File: true";
-   
-   return "\nIndex-File: true\nLast-Modified: " + TimeRFC1123(Buf.st_mtime);
+
+   string res = "\nIndex-File: true\nLast-Modified: " 
+     + TimeRFC1123(Buf.st_mtime);
+
+   switch (State)
+   {
+   case StateIndexDownload:
+      break;
+   case StateDiffsApply:
+      {
+	 string path =  _config->FindDir("Dir::State::lists");
+	 res += "\nPatches:";
+	 for (std::vector<DiffInfo>::iterator i = RequiredDiffs.begin(); 
+	      i != RequiredDiffs.end(); 
+	      i++)
+	 {
+	    res += "\n " + path + URItoFileName(RealURI + ".diff/" + i->file);
+	 }
+      }
+      break;
+   default:
+      break;
+   }
+
+   return res;     
 }
 									/*}}}*/
-bool pkgAcqDiffIndex::ParseDiffIndex(string IndexDiffFile)		/*{{{*/
+bool pkgAcqIndexByDiffs::ParseDiffIndex(string DiffIndexFile)		/*{{{*/
 {
    if(Debug)
-      std::clog << "pkgAcqDiffIndex::ParseDiffIndex() " << IndexDiffFile 
+      std::clog << "pkgAcqIndexByDiffs::ParseDiffIndex() " << DiffIndexFile 
 		<< std::endl;
 
    pkgTagSection Tags;
-   string ServerSha1;
-   vector<DiffInfo> available_patches;
+   string ServerSha1, size;
    
-   FileFd Fd(IndexDiffFile,FileFd::ReadOnly);
+   FileFd Fd(DiffIndexFile,FileFd::ReadOnly);
    pkgTagFile TF(&Fd);
    if (_error->PendingError() == true)
       return false;
 
-   if(TF.Step(Tags) == true)
+   if(!TF.Step(Tags))
    {
-      bool found = false;
-      DiffInfo d;
-      string size;
-
-      string const tmp = Tags.FindS("SHA1-Current");
-      std::stringstream ss(tmp);
-      ss >> ServerSha1 >> size;
-      unsigned long const ServerSize = atol(size.c_str());
-
-      FileFd fd(CurrentPackagesFile, FileFd::ReadOnly);
-      SHA1Summation SHA1;
-      SHA1.AddFD(fd);
-      string const local_sha1 = SHA1.Result();
-
-      if(local_sha1 == ServerSha1) 
-      {
-	 // we have the same sha1 as the server
-	 if(Debug)
-	    std::clog << "Package file is up-to-date" << std::endl;
-	 // set found to true, this will queue a pkgAcqIndexDiffs with
-	 // a empty availabe_patches
-	 found = true;
-      } 
-      else 
-      {
-	 if(Debug)
-	    std::clog << "SHA1-Current: " << ServerSha1 << " and we start at "<< fd.Name() << " " << fd.Size() << " " << local_sha1 << std::endl;
-
-	 // check the historie and see what patches we need
-	 string const history = Tags.FindS("SHA1-History");
-	 std::stringstream hist(history);
-	 while(hist >> d.sha1 >> size >> d.file)
-	 {
-	    // read until the first match is found
-	    // from that point on, we probably need all diffs
-	    if(d.sha1 == local_sha1) 
-	       found=true;
-	    else if (found == false)
-	       continue;
-
-	    if(Debug)
-	       std::clog << "Need to get diff: " << d.file << std::endl;
-	    available_patches.push_back(d);
-	 }
-
-	 if (available_patches.empty() == false)
-	 {
-	    // patching with too many files is rather slow compared to a fast download
-	    unsigned long const fileLimit = _config->FindI("Acquire::PDiffs::FileLimit", 20);
-	    if (fileLimit != 0 && fileLimit < available_patches.size())
-	    {
-	       if (Debug)
-		  std::clog << "Need " << available_patches.size() << " diffs (Limit is " << fileLimit
-			<< ") so fallback to complete download" << std::endl;
-	       return false;
-	    }
-
-	    // see if the patches are too big
-	    found = false; // it was true and it will be true again at the end
-	    d = *available_patches.begin();
-	    string const firstPatch = d.file;
-	    unsigned long patchesSize = 0;
-	    std::stringstream patches(Tags.FindS("SHA1-Patches"));
-	    while(patches >> d.sha1 >> size >> d.file)
-	    {
-	       if (firstPatch == d.file)
-		  found = true;
-	       else if (found == false)
-		  continue;
-
-	       patchesSize += atol(size.c_str());
-	    }
-	    unsigned long const sizeLimit = ServerSize * _config->FindI("Acquire::PDiffs::SizeLimit", 100);
-	    if (sizeLimit > 0 && (sizeLimit/100) < patchesSize)
-	    {
-	       if (Debug)
-		  std::clog << "Need " << patchesSize << " bytes (Limit is " << sizeLimit/100
-			<< ") so fallback to complete download" << std::endl;
-	       return false;
-	    }
-	 }
-      }
-
-      // we have something, queue the next diff
-      if(found) 
-      {
-	 // queue the diffs
-	 string::size_type const last_space = Description.rfind(" ");
-	 if(last_space != string::npos)
-	    Description.erase(last_space, Description.size()-last_space);
-	 new pkgAcqIndexDiffs(Owner, RealURI, Description, Desc.ShortDesc,
-			      ExpectedHash, ServerSha1, available_patches);
-	 Complete = false;
-	 Status = StatDone;
-	 Dequeue();
-	 return true;
-      }
+      if (Debug)
+	 std::clog << "Could not parse diff index file: " << DiffIndexFile
+		   << endl;
+      return false;
    }
-   
-   // Nothing found, report and return false
-   // Failing here is ok, if we return false later, the full
-   // IndexFile is queued
+
+   std::stringstream ss(Tags.FindS("SHA1-Current"));
+   ss >> ServerSha1 >> size;
+   unsigned long const ServerSize = atol(size.c_str());
+
+   FileFd fd(CurrentPackagesFile, FileFd::ReadOnly);
+   SHA1Summation SHA1;
+   SHA1.AddFD(fd);
+   string const local_sha1 = SHA1.Result();
+
+   if(local_sha1 == ServerSha1) 
+   {
+      // we have the same sha1 as the server
+      if(Debug)
+	 std::clog << "Package file is up-to-date" << std::endl;
+      // set found to true, this will queue a pkgAcqIndexDiff with
+      // an empty available_patches
+      Complete = true;
+      State = StateCompleted;
+      Status = StatDone;
+      Dequeue();
+      return true;
+   }
+
    if(Debug)
-      std::clog << "Can't find a patch in the index file" << std::endl;
-   return false;
+      std::clog << "SHA1-Current: " << ServerSha1 << " and we start at "<< fd.Name() << " " << fd.Size() << " " << local_sha1 << std::endl;
+
+   // check the history and see what patches we need
+   std::stringstream hist(Tags.FindS("SHA1-History"));
+   std::stringstream patches(Tags.FindS("SHA1-Patches"));
+   std::string idxsha1, idxsize, idxfile;
+   unsigned long patchesSize = 0;
+   bool found = false;
+
+   found = false;
+   while(hist >> idxsha1 >> idxsize >> idxfile)
+   {
+      DiffInfo d;
+      patches >> d.sha1 >> size >> d.file;
+      if (idxfile != d.file)
+      {
+ 	 if (Debug)
+	    std::clog << "SHA1-History and SHA1-Patches lack same ordering" 
+	 	      << endl;
+	 return false;
+      }
+
+      // read until the first match is found
+      // from that point on, we probably need all diffs
+      if(idxsha1 == local_sha1) 
+	 found=true;
+      else if (found == false)
+	 continue;
+
+      d.size = atol(size.c_str());
+
+      if(Debug)
+	 std::clog << "Need to get diff: " << d.file << std::endl;
+      RequiredDiffs.push_back(d);
+      patchesSize += d.size;
+   }
+
+   if (!found)
+   {
+      if(Debug)
+	 std::clog << "Package file is too old to patch" << std::endl;
+      return false;
+   }
+ 
+   // patching with too many files is rather slow compared to a fast download
+   unsigned long const fileLimit = _config->FindI("Acquire::PDiffs::FileLimit", 20);
+   if (fileLimit != 0 && fileLimit < RequiredDiffs.size())
+   {
+      if (Debug)
+	 std::clog << "Need " << RequiredDiffs.size() 
+		   << " diffs (Limit is " << fileLimit
+		   << ") so fallback to complete download" << std::endl;
+      return false;
+   }
+
+   // see if the patches are too big
+   unsigned long const sizeLimit = ServerSize * _config->FindI("Acquire::PDiffs::SizeLimit", 100);
+   if (sizeLimit > 0 && (sizeLimit/100) < patchesSize)
+   {
+      if (Debug)
+	 std::clog << "Need " << patchesSize << " bytes (Limit is " << sizeLimit/100
+		   << ") so fallback to complete download" << std::endl;
+      return false;
+   }
+
+   // we have something, queue the next diff
+   // queue the diffs
+   string::size_type const last_space = Description.rfind(" ");
+   if(last_space != string::npos)
+      Description.erase(last_space, Description.size()-last_space);
+
+   State = StateDiffsDownload;
+   DiffsToDownload = RequiredDiffs.size();
+   for (std::vector<DiffInfo>::iterator i = RequiredDiffs.begin(); 
+	i != RequiredDiffs.end(); 
+	i++)
+   {
+      new pkgAcqIndexDiff(Owner, this, 
+			  RealURI, Description, Desc.ShortDesc, *i);
+   }
+   Complete = false;
+   Status = StatDone;
+   Dequeue();
+   return true;
+
 }
 									/*}}}*/
-void pkgAcqDiffIndex::Failed(string Message,pkgAcquire::MethodConfig *Cnf)	/*{{{*/
+void pkgAcqIndexByDiffs::Failed(string Message,pkgAcquire::MethodConfig *Cnf)	/*{{{*/
 {
    if(Debug)
-      std::clog << "pkgAcqDiffIndex failed: " << Desc.URI << std::endl
+   {
+      std::clog << "pkgAcqIndexByDiffs failed: " << Desc.URI << std::endl
 		<< "Falling back to normal index file aquire" << std::endl;
+      if (Message != "")
+	std::clog << "Message was: " << Message << endl;
+   }
 
    new pkgAcqIndex(Owner, RealURI, Description, Desc.ShortDesc, 
 		   ExpectedHash);
 
    Complete = false;
+   State = StateFailed;
    Status = StatDone;
    Dequeue();
 }
+
 									/*}}}*/
-void pkgAcqDiffIndex::Done(string Message,unsigned long long Size,string Md5Hash,	/*{{{*/
+void pkgAcqIndexByDiffs::DiffDownloaded(bool success)                   /*{{{*/
+{
+   if (!success)
+   {
+      State = StateFailed;
+   }
+
+   if (DiffsToDownload == 0)
+      return; // wtf
+
+   DiffsToDownload--;
+
+   if (DiffsToDownload != 0)
+      return;
+
+   if (State == StateFailed)
+   {
+      Failed("Could not download all index diffs", NULL);
+      return;
+   } 
+   else
+   {
+      // We have all the diffs now, so we can apply them.
+      State = StateDiffsApply;
+      Desc.Description = Description;
+      Desc.Owner = this;
+      string FinalFile = _config->FindDir("Dir::State::lists")+URItoFileName(RealURI);
+      Desc.URI = "rred:" + FinalFile;
+      QueueURI(Desc);
+   }
+} 
+									/*}}}*/
+void pkgAcqIndexByDiffs::Done(string Message,unsigned long long Size,string Md5Hash,	/*{{{*/
 			   pkgAcquire::MethodConfig *Cnf)
 {
    if(Debug)
-      std::clog << "pkgAcqDiffIndex::Done(): " << Desc.URI << std::endl;
+      std::clog << "pkgAcqIndexByDiffs::Done(): " << Desc.URI << std::endl;
 
    Item::Done(Message,Size,Md5Hash,Cnf);
 
    string FinalFile;
    FinalFile = _config->FindDir("Dir::State::lists")+URItoFileName(RealURI);
 
-   // sucess in downloading the index
-   // rename the index
-   FinalFile += string(".IndexDiff");
-   if(Debug)
-      std::clog << "Renaming: " << DestFile << " -> " << FinalFile 
-		<< std::endl;
-   Rename(DestFile,FinalFile);
-   chmod(FinalFile.c_str(),0644);
-   DestFile = FinalFile;
+   if (State == StateIndexDownload)
+   {
+      // sucess in downloading the index
+      // rename the index
+      FinalFile += string(".IndexDiff");
+      if(Debug)
+	 std::clog << "Renaming: " << DestFile << " -> " << FinalFile 
+		   << std::endl;
+      Rename(DestFile,FinalFile);
+      chmod(FinalFile.c_str(),0644);
+      DestFile = FinalFile;
 
-   if(!ParseDiffIndex(DestFile))
-      return Failed("", NULL);
+      if(!ParseDiffIndex(DestFile))
+	 Failed("Parsing failed", NULL);
+      return;
+   }
 
-   Complete = true;
-   Status = StatDone;
-   Dequeue();
-   return;
+   if (State == StateDiffsApply)
+   {
+     Rename(DestFile,FinalFile);
+     chmod(FinalFile.c_str(),0644);
+     DestFile = FinalFile;
+     if(!ExpectedHash.empty() && !ExpectedHash.VerifyFile(DestFile))
+     {
+        RenameOnError(HashSumMismatch);
+	Failed("Hash verify failed", NULL);
+        return;
+     }
+     else
+     {
+        // this is for the "real" finish
+        Complete = true;
+	State = StateCompleted;
+        Status = StatDone;
+        Dequeue();
+        return;
+     }
+   }
 }
 									/*}}}*/
 // AcqIndexDiffs::AcqIndexDiffs - Constructor				/*{{{*/
@@ -568,202 +662,108 @@ void pkgAcqDiffIndex::Done(string Message,unsigned long long Size,string Md5Hash
 /* The package diff is added to the queue. one object is constructed
  * for each diff and the index
  */
-pkgAcqIndexDiffs::pkgAcqIndexDiffs(pkgAcquire *Owner,
-				   string URI,string URIDesc,string ShortDesc,
-				   HashString ExpectedHash, 
-				   string ServerSha1,
-				   vector<DiffInfo> diffs)
-   : Item(Owner), RealURI(URI), ExpectedHash(ExpectedHash), 
-     available_patches(diffs), ServerSha1(ServerSha1)
+pkgAcqIndexDiff::pkgAcqIndexDiff(pkgAcquire *Owner,
+				 pkgAcqIndexByDiffs *IBD,
+			         string URI,string URIDesc,string ShortDesc,
+				 DiffInfo &Diff)
+   : Item(Owner), IndexByDiffs(IBD)
 {
-   
+   RealURI = URI + ".diff/" + Diff.file;
+   ServerSha1 = Diff.sha1;
+ 
    DestFile = _config->FindDir("Dir::State::lists") + "partial/";
-   DestFile += URItoFileName(URI);
+   DestFile += URItoFileName(RealURI);
 
    Debug = _config->FindB("Debug::pkgAcquire::Diffs",false);
 
    Description = URIDesc;
    Desc.Owner = this;
-   Desc.ShortDesc = ShortDesc;
+   Desc.URI = RealURI + ".gz";
+   Desc.Description = Description + " " + Diff.file;
+   Desc.ShortDesc = ShortDesc + " " + Diff.file;
 
-   if(available_patches.empty() == true)
-   {
-      // we are done (yeah!)
-      Finish(true);
-   }
-   else
-   {
-      // get the next diff
-      State = StateFetchDiff;
-      QueueNextDiff();
-   }
-}
-									/*}}}*/
-void pkgAcqIndexDiffs::Failed(string Message,pkgAcquire::MethodConfig *Cnf)	/*{{{*/
-{
-   if(Debug)
-      std::clog << "pkgAcqIndexDiffs failed: " << Desc.URI << std::endl
-		<< "Falling back to normal index file aquire" << std::endl;
-   new pkgAcqIndex(Owner, RealURI, Description,Desc.ShortDesc, 
-		   ExpectedHash);
-   Finish();
-}
-									/*}}}*/
-// Finish - helper that cleans the item out of the fetcher queue	/*{{{*/
-void pkgAcqIndexDiffs::Finish(bool allDone)
-{
-   // we restore the original name, this is required, otherwise
-   // the file will be cleaned
-   if(allDone) 
-   {
-      DestFile = _config->FindDir("Dir::State::lists");
-      DestFile += URItoFileName(RealURI);
-
-      if(!ExpectedHash.empty() && !ExpectedHash.VerifyFile(DestFile))
-      {
-	 RenameOnError(HashSumMismatch);
-	 Dequeue();
-	 return;
-      }
-
-      // this is for the "real" finish
-      Complete = true;
-      Status = StatDone;
-      Dequeue();
-      if(Debug)
-	 std::clog << "\n\nallDone: " << DestFile << "\n" << std::endl;
-      return;
-   }
+   State = StateFetchDiff;
 
    if(Debug)
-      std::clog << "Finishing: " << Desc.URI << std::endl;
-   Complete = false;
-   Status = StatDone;
-   Dequeue();
-   return;
-}
-									/*}}}*/
-bool pkgAcqIndexDiffs::QueueNextDiff()					/*{{{*/
-{
-
-   // calc sha1 of the just patched file
-   string FinalFile = _config->FindDir("Dir::State::lists");
-   FinalFile += URItoFileName(RealURI);
-
-   FileFd fd(FinalFile, FileFd::ReadOnly);
-   SHA1Summation SHA1;
-   SHA1.AddFD(fd);
-   string local_sha1 = string(SHA1.Result());
-   if(Debug)
-      std::clog << "QueueNextDiff: " 
-		<< FinalFile << " (" << local_sha1 << ")"<<std::endl;
-
-   // final file reached before all patches are applied
-   if(local_sha1 == ServerSha1)
-   {
-      Finish(true);
-      return true;
-   }
-
-   // remove all patches until the next matching patch is found
-   // this requires the Index file to be ordered
-   for(vector<DiffInfo>::iterator I=available_patches.begin();
-       available_patches.empty() == false &&
-	  I != available_patches.end() &&
-	  I->sha1 != local_sha1;
-       ++I)
-   {
-      available_patches.erase(I);
-   }
-
-   // error checking and falling back if no patch was found
-   if(available_patches.empty() == true)
-   {
-      Failed("", NULL);
-      return false;
-   }
-
-   // queue the right diff
-   Desc.URI = string(RealURI) + ".diff/" + available_patches[0].file + ".gz";
-   Desc.Description = Description + " " + available_patches[0].file + string(".pdiff");
-   DestFile = _config->FindDir("Dir::State::lists") + "partial/";
-   DestFile += URItoFileName(RealURI + ".diff/" + available_patches[0].file);
-
-   if(Debug)
-      std::clog << "pkgAcqIndexDiffs::QueueNextDiff(): " << Desc.URI << std::endl;
+      std::clog << "pkgAcqIndexDiff::pkgAcqIndexDiff(..): " << Desc.URI << std::endl;
    
    QueueURI(Desc);
-
-   return true;
 }
 									/*}}}*/
-void pkgAcqIndexDiffs::Done(string Message,unsigned long long Size,string Md5Hash,	/*{{{*/
+void pkgAcqIndexDiff::Failed(string Message,pkgAcquire::MethodConfig *Cnf)	/*{{{*/
+{
+   if(Status == StatDone)
+      return;
+   if(Debug)
+      std::clog << "pkgAcqIndexDiff failed: " << Desc.URI << std::endl;
+   IndexByDiffs->DiffDownloaded(false);
+   Complete = false;
+   Status = StatDone;
+
+   Dequeue();
+}
+									/*}}}*/
+void pkgAcqIndexDiff::Done(string Message,unsigned long long Size,string Md5Hash,	/*{{{*/
 			    pkgAcquire::MethodConfig *Cnf)
 {
    if(Debug)
-      std::clog << "pkgAcqIndexDiffs::Done(): " << Desc.URI << std::endl;
+      std::clog << "pkgAcqIndexDiff::Done(): " << Desc.URI << std::endl;
 
    Item::Done(Message,Size,Md5Hash,Cnf);
 
-   string FinalFile;
-   FinalFile = _config->FindDir("Dir::State::lists")+URItoFileName(RealURI);
+   string DestFileGZ = DestFile + ".gz";
 
    // sucess in downloading a diff, un-gzip it
    if(State == StateFetchDiff)
    {
-      // rred excepts the patch as $FinalFile.ed
-      Rename(DestFile,FinalFile+".ed.gz");
+      Rename(DestFile,DestFileGZ);
       if(Debug)
-	 std::clog << "Sending ed to gzip method: " << FinalFile << std::endl;
+	 std::clog << "Sending diff to gzip method: " << DestFile << std::endl;
       State = StateUnzipDiff;
       Local = true;
-      Desc.URI = "gzip:" + FinalFile + ".ed.gz";
+      Desc.URI = "gzip:" + DestFile + ".gz";
+      Desc.ShortDesc += " gunzip";
+      Desc.Description += " gunzip";
       QueueURI(Desc);
       Mode = "gzip";
       return;
    }
 
+   string FinalFile;
+   FinalFile = _config->FindDir("Dir::State::lists")+URItoFileName(RealURI);
+
    // sucess in ungzipping the diff, enter ApplyDiff state
    if(State == StateUnzipDiff)
    {
-
-      // rred excepts the patch as $FinalFile.ed
-      Rename(DestFile,FinalFile+".ed");
-
-      if(Debug)
-	 std::clog << "Sending to rred method: " << FinalFile << std::endl;
-
-      State = StateApplyDiff;
-      Local = true;
-      Desc.URI = "rred:" + FinalFile;
-      QueueURI(Desc);
-      Mode = "rred";
-      return;
-   } 
-
-
-   // success in download/apply a diff, queue next (if needed)
-   if(State == StateApplyDiff)
-   {
-      // remove the just applied patch
-      available_patches.erase(available_patches.begin());
-
       // move into place
       if(Debug) 
-      {
-	 std::clog << "Moving patched file in place: " << std::endl
+	 std::clog << "Moving diff into place: " << std::endl
 		   << DestFile << " -> " << FinalFile << std::endl;
-      }
+      unlink(DestFileGZ.c_str());
+
       Rename(DestFile,FinalFile);
       chmod(FinalFile.c_str(),0644);
 
-      // see if there is more to download
-      if(available_patches.empty() == false) {
-	 new pkgAcqIndexDiffs(Owner, RealURI, Description, Desc.ShortDesc,
-			      ExpectedHash, ServerSha1, available_patches);
-	 return Finish();
-      } else 
-	 return Finish(true);
+      DestFile = FinalFile;
+
+      if(!ExpectedHash.empty() && !ExpectedHash.VerifyFile(DestFile))
+      {
+	 RenameOnError(HashSumMismatch);
+	 Dequeue();
+	 IndexByDiffs->DiffDownloaded(false);
+	 return;
+      }
+      else
+      {
+	 // this is for the "real" finish
+	 Complete = true;
+	 Status = StatDone;
+	 Dequeue();
+	 IndexByDiffs->DiffDownloaded(true);
+	 if(Debug)
+	    std::clog << "\n\nallDone: " << DestFile << "\n" << std::endl;
+	 return;
+      }
    }
 }
 									/*}}}*/
@@ -1461,7 +1461,7 @@ void pkgAcqMetaIndex::QueueIndexes(bool verify)				/*{{{*/
 	 {
 	    if (_config->FindB("Acquire::PDiffs",true) == true && transInRelease == true &&
 		MetaIndexParser->Exists(string((*Target)->MetaKey).append(".diff/Index")) == true)
-	       new pkgAcqDiffIndex(Owner, (*Target)->URI, (*Target)->Description,
+	       new pkgAcqIndexByDiffs(Owner, (*Target)->URI, (*Target)->Description,
 				   (*Target)->ShortDesc, ExpectedIndexHash);
 	    else
 	       new pkgAcqIndexTrans(Owner, *Target, ExpectedIndexHash, MetaIndexParser);
@@ -1471,11 +1471,11 @@ void pkgAcqMetaIndex::QueueIndexes(bool verify)				/*{{{*/
 
       /* Queue Packages file (either diff or full packages files, depending
          on the users option) - we also check if the PDiff Index file is listed
-         in the Meta-Index file. Ideal would be if pkgAcqDiffIndex would test this
+         in the Meta-Index file. Ideal would be if pkgAcqIndexByDiffs would test this
          instead, but passing the required info to it is to much hassle */
       if(_config->FindB("Acquire::PDiffs",true) == true && (verify == false ||
 	  MetaIndexParser->Exists(string((*Target)->MetaKey).append(".diff/Index")) == true))
-	 new pkgAcqDiffIndex(Owner, (*Target)->URI, (*Target)->Description,
+	 new pkgAcqIndexByDiffs(Owner, (*Target)->URI, (*Target)->Description,
 			     (*Target)->ShortDesc, ExpectedIndexHash);
       else
 	 new pkgAcqIndex(Owner, *Target, ExpectedIndexHash, MetaIndexParser);

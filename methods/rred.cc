@@ -18,6 +18,8 @@
 
 #include <string>
 #include <list>
+#include <vector>
+#include <iterator>
 
 #include <assert.h>
 #include <stdio.h>
@@ -366,7 +368,8 @@ class Patch {
       char buffer[BLOCK_SIZE];
       size_t l;
       while (n > 0) {
-         fgets(buffer, sizeof(buffer), i);
+	 if (fgets(buffer, sizeof(buffer), i) == 0) 
+	    buffer[0] = '\0';
          l = strlen(buffer);
          if (l == 0 || buffer[l-1] == '\n')
             n--;
@@ -382,7 +385,8 @@ class Patch {
       char buffer[BLOCK_SIZE];
       size_t l;
       while (n > 0) {
-         fgets(buffer, sizeof(buffer), i);
+	 if (fgets(buffer, sizeof(buffer), i) == 0)
+	    buffer[0] = '\0'; 
          l = strlen(buffer);
          if (l == 0 || buffer[l-1] == '\n')
              n--;
@@ -531,11 +535,66 @@ class Patch {
    }
 };
 
+bool LookupPatches(const std::string &Message, std::vector<std::string> &lines)
+{
+   const char *Tag = "Patches";
+   const size_t Length = strlen(Tag);
+   
+   std::string::const_iterator I, J;
+
+   std::clog << "Looking for \"Patches:\" section in message:\n\n" << Message << "\n\n";
+   std::clog.flush();
+   
+   for (I = Message.begin(); I + Length < Message.end(); ++I)
+   {
+      if (I[Length] == ':' && stringcasecmp(I, I+Length, Tag) == 0)
+      {
+	 // found the tag, now read the patches
+	 for(;;) {
+	   for (; I < Message.end() && *I != '\n'; ++I);
+	    if (I < Message.end()) I++;
+	    if (I == Message.end() || *I != ' ')
+	       break;
+	    while (I < Message.end() && isspace(*I)) I++;
+	    for (J = I; J < Message.end() && *J != '\n'; ++J)
+	       ;
+	    do
+	       J--;
+	    while (I < J && isspace(*J));
+	    if (I < J)
+	       lines.push_back(std::string(I,++J));
+	    else
+	      break;
+	    I = J;
+	 }
+	 std::clog << "Found " << lines.size() << " patches!\n";
+	 std::clog.flush();
+	 return true;
+      }
+   }
+   std::clog << "Found no patches! :(\n";
+   std::clog.flush();
+   return false;
+}
+
+
 class RredMethod : public pkgAcqMethod {
    private:
       bool Debug;
+      std::vector<std::string> patchpaths; 
 
    protected:
+      virtual bool HandleMessage(int Number, std::string Message) {
+ 	 if (Number == 600)
+	 {
+	    patchpaths.clear();
+	    LookupPatches(Message, patchpaths);
+	    std::clog << "Ended up with " << patchpaths.size() << " patches!\n";
+	    std::clog.flush();
+	 }
+	 return pkgAcqMethod::HandleMessage(Number, Message);
+      }
+	    
       virtual bool Fetch(FetchItem *Itm) {
 	 Debug = _config->FindB("Debug::pkgAcquire::RRed", false);
 	 URI Get = Itm->Uri;
@@ -549,17 +608,37 @@ class RredMethod : public pkgAcqMethod {
 	 } else
 	    URIStart(Res);
 
-	 std::string patch_name = Path + ".ed";
+	 Patch patch;
+
+	 if (patchpaths.empty())
+	 {
+	    patchpaths.push_back(Path + ".ed");
+	 }
+
+	 std::string patch_name;
+	 for (std::vector<std::string>::iterator I = patchpaths.begin();
+	      I != patchpaths.end();
+	      I++)
+	 {
+	    patch_name = *I;
+	    if (Debug == true)
+	       std::clog << "Patching " << Path << " with " << patch_name
+			 << std::endl;
+
+	    FILE *p = fopen(patch_name.c_str(), "r");
+	    if (p == NULL) {
+	      std::clog << "Could not open patch file " << patch_name << std::endl;
+	      abort();
+	    }
+	    patch.read_diff(p);
+	    fclose(p);
+	 }
 
 	 if (Debug == true)
-	    std::clog << "Patching " << Path << " with " << patch_name
-	       << ".ed and putting result into " << Itm->DestFile << std::endl;
-
-	 Patch patch;
-	 FILE *p = fopen(patch_name.c_str(), "r");
-         patch.read_diff(p);
-	 fclose(p);
-
+	    std::clog << "Applying patches against " << Path 
+		      << " and writing results to " << Itm->DestFile
+		      << std::endl;
+	 
 	 FILE *inp = fopen(Path.c_str(), "r");
 	 FILE *out = fopen(Itm->DestFile.c_str(), "w");
 
